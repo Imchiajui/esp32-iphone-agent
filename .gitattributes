@@ -8,3 +8,4 @@
 *.ino text eol=lf
 *.h text eol=lf
 .env.example text eol=lf
+*.bat text eol=crlf
