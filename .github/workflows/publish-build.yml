@@ -1,0 +1,36 @@
+# 把某次 Build for Windows 的產物發佈成 GitHub Release（公開下載，不用登入）
+name: Publish build
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build for Windows 的 run ID"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          ls -la dist
+          gh release create "build-$RUN_ID" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Windows build $RUN_ID" \
+            --notes "From Build for Windows run $RUN_ID" \
+            --prerelease
