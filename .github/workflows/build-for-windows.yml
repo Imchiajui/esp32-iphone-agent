@@ -1,0 +1,100 @@
+# 放到你 fork 的 .github/workflows/build-for-windows.yml
+# Actions 分頁 → Build for Windows → Run workflow
+# 跑完在該次執行頁面最下方下載兩個 artifact：
+#   firmware  → esp32-agent-merged-0x0.bin（瀏覽器燒錄，位址 0x0）
+#   ios-ipa   → ESP32Agent-unsigned.ipa（Sideloadly 側載）
+
+name: Build for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "App Bundle ID（留空 = io.github.<你的帳號>.esp32agent）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and NimBLE
+        run: |
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls "$URL"
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls "$URL"
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+
+      - name: Build (flash.sh 會套用 nimble_cfg.h 的 BLE buffer 設定)
+        run: hardware/flash.sh --build-only
+
+      - name: Merge into one bin
+        run: |
+          B=hardware/build
+          ls -la "$B"
+          mkdir -p out
+          if [ -f "$B/hid_bridge.ino.merged.bin" ]; then
+            cp "$B/hid_bridge.ino.merged.bin" out/esp32-agent-merged-0x0.bin
+          else
+            pip install --quiet "esptool==4.8.1"
+            BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -n 1)
+            esptool.py --chip esp32s3 merge_bin -o out/esp32-agent-merged-0x0.bin \
+              --flash_mode keep --flash_freq keep --flash_size 8MB \
+              0x0     "$B/hid_bridge.ino.bootloader.bin" \
+              0x8000  "$B/hid_bridge.ino.partitions.bin" \
+              0xe000  "$BOOT_APP0" \
+              0x10000 "$B/hid_bridge.ino.bin"
+          fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/
+
+  ios:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Write Local.xcconfig (no team, no entitlements → 免費 Apple ID 可簽)
+        working-directory: ios
+        env:
+          INPUT_ID: ${{ inputs.bundle_id }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          ID="$INPUT_ID"
+          if [ -z "$ID" ]; then
+            ID="io.github.$(echo "$OWNER" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9-').esp32agent"
+          fi
+          echo "$ID" | grep -Eq '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$' || { echo "bad bundle id: $ID"; exit 1; }
+          echo "Bundle ID: $ID"
+          printf 'IA_BUNDLE_ID = %s\n' "$ID" > Config/Local.xcconfig
+
+      - name: Build unsigned
+        working-directory: ios
+        run: |
+          xcodebuild build \
+            -project IPhoneAgent.xcodeproj -scheme IPhoneAgent -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          APP=ios/build/Build/Products/Release-iphoneos/IPhoneAgent.app
+          test -d "$APP"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry ../ESP32Agent-unsigned.ipa Payload)
+          ls -la ESP32Agent-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: ESP32Agent-unsigned.ipa
