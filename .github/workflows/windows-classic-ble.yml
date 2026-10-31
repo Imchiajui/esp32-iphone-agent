@@ -1,0 +1,119 @@
+# Windows + classic ESP32 (BLE mouse over USB serial) build.
+# Push to this branch, then download the artifacts from the run page:
+#   firmware-classic-ble  → hid_bridge_ble_c3.ino.merged.bin（網頁燒錄，位址 0x0）
+#   uxplay-win64          → 免安裝的 uxplay.exe（含 GStreamer 外掛）
+name: Windows classic BLE
+
+on:
+  push:
+    branches: [windows-classic-ble]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core and NimBLE
+        run: |
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls "$URL"
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls "$URL"
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+      - name: Build (classic ESP32, commands over USB serial)
+        working-directory: hardware
+        run: |
+          arduino-cli compile -b "esp32:esp32:esp32:PartitionScheme=huge_app" \
+            --build-property "compiler.cpp.extra_flags=-DSERIAL_LINK=1" \
+            --output-dir build_ble hid_bridge_ble_c3
+          ls -la build_ble
+          test -f build_ble/hid_bridge_ble_c3.ino.merged.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-classic-ble
+          path: hardware/build_ble/hid_bridge_ble_c3.ino.merged.bin
+
+  server-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev,mcp]"
+      - run: ruff check .
+      - run: pytest -q
+
+  uxplay-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ntldd
+            mingw-w64-ucrt-x86_64-libplist
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-gstreamer
+            mingw-w64-ucrt-x86_64-gst-plugins-base
+            mingw-w64-ucrt-x86_64-gst-plugins-good
+            mingw-w64-ucrt-x86_64-gst-plugins-bad
+            mingw-w64-ucrt-x86_64-gst-libav
+
+      - name: Build UxPlay
+        run: |
+          git clone --depth 1 https://github.com/FDH2/UxPlay uxplay-src
+          git -C uxplay-src log -1 --format='UxPlay %H %cs'
+          cmake -S uxplay-src -B uxplay-build -G Ninja
+          ninja -C uxplay-build
+          ls -la uxplay-build/uxplay.exe
+
+      - name: Bundle with GStreamer (relocatable layout)
+        run: |
+          D=dist/uxplay-win64
+          mkdir -p $D/bin $D/lib/gstreamer-1.0 $D/libexec/gstreamer-1.0
+          cp uxplay-build/uxplay.exe $D/bin/
+          cp /ucrt64/bin/gst-inspect-1.0.exe $D/bin/
+          cp /ucrt64/libexec/gstreamer-1.0/gst-plugin-scanner.exe $D/libexec/gstreamer-1.0/
+          cp /ucrt64/lib/gstreamer-1.0/*.dll $D/lib/gstreamer-1.0/
+          # every DLL that uxplay, the tools and the plugins load, found recursively; plugins whose optional
+          # dependencies are not installed simply fail to load at runtime
+          for f in $D/bin/*.exe $D/libexec/gstreamer-1.0/*.exe $D/lib/gstreamer-1.0/*.dll; do
+            ntldd -R "$f" 2>/dev/null | grep -io '[a-z]:\\[^ ]*\\ucrt64\\bin\\[^ ]*\.dll' || true
+          done | sort -u > deps.txt
+          wc -l deps.txt
+          while read -r w; do cp -n "$(cygpath -u "$w")" $D/bin/; done < deps.txt
+          git -C uxplay-src log -1 --format='UxPlay %H %cs' > $D/VERSION.txt
+          du -sh $D
+
+      - name: Smoke test outside MSYS2
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $b = "dist\uxplay-win64\bin"
+          & "$b\uxplay.exe" -h | Select-Object -First 3
+          foreach ($p in "jpegenc","tcpclientsink","videorate","videoconvert","h264parse","avdec_h264","appsrc","decodebin") {
+            & "$b\gst-inspect-1.0.exe" --exists $p
+            if ($LASTEXITCODE -ne 0) { throw "missing GStreamer element: $p" }
+            Write-Host "ok $p"
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uxplay-win64
+          path: dist/

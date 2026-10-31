@@ -1,14 +1,112 @@
-"""TCP link to the HID bridge board (see firmware/hid_bridge)."""
+"""Link to the HID bridge board: TCP over Wi-Fi (see firmware/hid_bridge), or the board's USB serial port
+(BLE bridge built with SERIAL_LINK=1, see hardware/hid_bridge_ble_c3)."""
 
 import asyncio
 import logging
+import threading
 import time
 
 log = logging.getLogger(__name__)
 
+# USB to UART chips and native USB found on ESP32 boards: CP210x, CH340, FTDI, Espressif
+BOARD_VIDS = (0x10C4, 0x1A86, 0x0403, 0x303A)
+
 
 class DeviceError(RuntimeError):
     pass
+
+
+class SerialLink:
+    """A pyserial port with the reader/writer methods Device uses. A thread reads lines; readline() returns only
+    replies ("ok..." / "err..."), so the ESP32 boot banner and the board's greeting never pass for an answer."""
+
+    def __init__(self, port, loop: asyncio.AbstractEventLoop):
+        self._port, self._loop = port, loop
+        self._lines: asyncio.Queue[bytes] = asyncio.Queue()
+        self._closed = False
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        buf = b""
+        while not self._closed:
+            try:
+                chunk = self._port.read(self._port.in_waiting or 1)
+            except Exception as e:  # unplugged: pyserial raises SerialException (an OSError) or worse on Windows
+                log.debug("serial read failed: %r", e)
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                self._loop.call_soon_threadsafe(self._lines.put_nowait, line + b"\n")
+        self._closed = True
+        self._loop.call_soon_threadsafe(self._lines.put_nowait, b"")  # end of stream
+
+    async def readline(self) -> bytes:
+        while True:
+            line = await self._lines.get()
+            if not line:
+                self._lines.put_nowait(b"")  # stay at end of stream for any later reader
+                return b""
+            text = line.strip()
+            if text.startswith((b"ok", b"err")):
+                return line
+            if text:
+                log.debug("board says: %s", text.decode(errors="replace"))
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            raise ConnectionResetError("serial port closed")
+        try:
+            self._port.write(data)
+        except Exception as e:
+            self.close()
+            raise ConnectionResetError(f"serial write failed: {e!r}") from e
+
+    async def drain(self) -> None:
+        pass
+
+    def discard(self) -> None:
+        """Drop lines already read but not consumed (late replies to an earlier sync)."""
+        while not self._lines.empty():
+            line = self._lines.get_nowait()
+            if not line:
+                self._lines.put_nowait(b"")
+                return
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._port.close()
+        except Exception:
+            pass
+
+    def get_extra_info(self, key, default=None):
+        return getattr(self._port, "port", default) if key == "peername" else default
+
+
+def find_serial_port() -> str | None:
+    """The first serial port that looks like an ESP32 board, by USB vendor id."""
+    from serial.tools import list_ports
+
+    for p in sorted(list_ports.comports(), key=lambda p: p.device):
+        if p.vid in BOARD_VIDS:
+            return p.device
+    return None
+
+
+def open_serial(name: str, baud: int = 115200):
+    import serial
+
+    port = serial.Serial()
+    port.port, port.baudrate, port.timeout, port.write_timeout = name, baud, 0.2, 2
+    # Dev boards wire DTR/RTS to EN and GPIO0 (auto-reset). Keep both released so opening the port does not
+    # reset the board or drop it into the bootloader.
+    port.dtr = port.rts = False
+    port.open()
+    return port
 
 
 class Device:
@@ -39,6 +137,60 @@ class Device:
         self.links += 1
         self._last = self._beat = time.time()  # fresh link: nothing to keep awake yet
         log.info("board connected from %s %s", writer.get_extra_info("peername"), hello)
+
+    async def serial(self, name: str, baud: int = 115200, retry: float = 2) -> None:
+        """Keep a board on a serial port attached: open it (name "auto" picks the first ESP32-like USB port),
+        sync, and reopen whenever it is unplugged or stops answering. Runs until cancelled."""
+        while True:
+            port_name = await asyncio.to_thread(find_serial_port) if name.lower() == "auto" else name
+            if not port_name:
+                await asyncio.sleep(retry)
+                continue
+            try:
+                port = await asyncio.to_thread(open_serial, port_name, baud)
+            except Exception as e:  # missing driver, port busy (e.g. the flasher still has it), unplugged
+                log.info("cannot open %s: %s", port_name, e)
+                await asyncio.sleep(retry)
+                continue
+            link = SerialLink(port, asyncio.get_running_loop())
+            try:
+                await self.attach_serial(link)
+            except DeviceError as e:
+                log.info("board on %s did not answer: %s", port_name, e)
+                link.close()
+                await asyncio.sleep(retry)
+                continue
+            while not link.is_closing():
+                await asyncio.sleep(0.5)
+            log.info("board on %s gone", port_name)
+
+    async def attach_serial(self, link, attempts: int = 8) -> str:
+        """Find the start of the conversation on a fresh serial link (the board may still be booting) and make it
+        the current board."""
+        for attempt in range(attempts):
+            reset = getattr(getattr(link, "_port", None), "reset_input_buffer", None)
+            if reset:
+                reset()
+            link.write(b"\nsync\n")
+            try:
+                reply = (await asyncio.wait_for(link.readline(), 1)).decode().strip()
+            except asyncio.TimeoutError:
+                continue
+            if not reply and link.is_closing():
+                break
+            if reply.startswith("ok hello"):
+                # an earlier sync that timed out may still be answered: let it arrive, then drop it, so the next
+                # command does not read a stale reply
+                await asyncio.sleep(0.2 if attempt == 0 else 1.2)
+                link.discard()
+                if self.connected:
+                    self._writer.close()
+                self._reader = self._writer = link
+                self.links += 1
+                self._last = self._beat = time.time()
+                log.info("board connected on %s: %s", link.get_extra_info("peername"), reply[3:])
+                return reply[3:]
+        raise DeviceError("no reply to sync (is the firmware built with SERIAL_LINK=1?)")
 
     async def wait_connected(self, timeout: float) -> bool:
         deadline = time.time() + timeout

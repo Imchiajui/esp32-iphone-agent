@@ -3,11 +3,22 @@
 //   ping | stats | tune <step> <step_ms> | home | move <dx> <dy> | press | release | click
 //   scroll <v> <h> | type <ascii text> | key <combo, e.g. cmd+h, enter>
 // The board answers "ok" or "err <why>"; "err ble not connected" when the phone is not paired/connected.
+//
+// Build with -DSERIAL_LINK=1 to take the same commands over the USB serial port (115200 baud) instead of Wi-Fi:
+// no secrets.h, no Wi-Fi, and the BLE radio has the antenna to itself. The server opens the port with
+// SERIAL_PORT=COM5 (or auto). Serial mode adds "sync", which releases everything and answers
+// "ok hello <reset reason> <uptime ms>", so the host can find the start of the conversation after boot noise.
 
-#include <WiFi.h>
+#ifndef SERIAL_LINK
+#define SERIAL_LINK 0
+#endif
+
 #include <esp_task_wdt.h>
 #include "ble_hid.h"
+#if !SERIAL_LINK
+#include <WiFi.h>
 #include "secrets.h"  // WIFI_SSID, WIFI_PASS, SERVER_HOST, SERVER_PORT
+#endif
 
 #ifndef BLE_NAME
 #define BLE_NAME "iPhone Agent HID"
@@ -21,7 +32,9 @@ const int HOME_REPORTS = 50;
 const int WATCHDOG_MS = 8000;
 
 BleHid hid;
+#if !SERIAL_LINK
 WiFiClient server;
+#endif
 
 void movePaced(long dx, long dy) {
   while (dx || dy) {
@@ -112,6 +125,53 @@ const char *resetReason() {
   }
 }
 
+#if SERIAL_LINK
+// Serial mode: commands arrive on UART0 through the board's USB to UART chip (CP2102/CH340).
+const unsigned long IDLE_RELEASE_MS = 10000;  // host gone mid-gesture: do not leave the button held forever
+String pending;
+unsigned long lastCommand = 0;
+
+void setup() {
+  Serial.setRxBufferSize(1024);
+  Serial.begin(115200);
+  hid.begin(BLE_NAME);
+  esp_task_wdt_config_t wdt = {.timeout_ms = WATCHDOG_MS, .idle_core_mask = 0, .trigger_panic = true};
+  esp_task_wdt_reconfigure(&wdt);
+  esp_task_wdt_add(NULL);
+  Serial.printf("\nhello %s %lu\n", resetReason(), millis());
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (pending.length() < 512) pending += c;
+      continue;
+    }
+    String line = pending;
+    pending = "";
+    line.trim();
+    if (!line.length()) continue;
+    lastCommand = millis();
+    String reply;
+    if (line == "sync") {
+      hid.releaseEverything();
+      reply = String("ok hello ") + resetReason() + " " + millis();
+    } else {
+      reply = run(line);
+    }
+    Serial.print(reply + "\n");
+  }
+  if (lastCommand && millis() - lastCommand > IDLE_RELEASE_MS) {
+    hid.releaseEverything();
+    lastCommand = 0;
+  }
+  delay(1);
+}
+
+#else
 void setup() {
 #if DEBUG_SERIAL
   Serial.begin(115200);
@@ -151,3 +211,4 @@ void loop() {
 #endif
   }
 }
+#endif

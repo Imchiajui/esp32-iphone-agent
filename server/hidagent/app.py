@@ -34,13 +34,19 @@ agent = Agent(phone, screen, LLM.from_env("ACTOR"), LLM.from_env("PLANNER"),
 
 @asynccontextmanager
 async def lifespan(_):
-    server = await device.serve("0.0.0.0", int(os.environ.get("DEVICE_PORT", 7300)))
+    # SERIAL_PORT=COM5 (or auto): the board is a BLE bridge plugged into this computer's USB (SERIAL_LINK=1 build)
+    serial_port = os.environ.get("SERIAL_PORT", "").strip()
+    server = None if serial_port else await device.serve("0.0.0.0", int(os.environ.get("DEVICE_PORT", 7300)))
+    link = asyncio.create_task(device.serial(serial_port)) if serial_port else None
     screen.start()
     awake = asyncio.create_task(device.keep_awake(screen=screen))
     yield
     awake.cancel()
+    if link:
+        link.cancel()
     screen.stop()
-    server.close()
+    if server:
+        server.close()
 
 
 app = FastAPI(lifespan=lifespan)
